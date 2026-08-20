@@ -133,6 +133,10 @@ run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).awai
 # }
 ```
 
+The TUI binary remains the default Cargo feature. Embedders can avoid its
+dashboard and HTTP dependencies with `tftp-rs = { default-features = false,
+... }`.
+
 ### TUI Controls
 
 | Key              | Action                                  |
