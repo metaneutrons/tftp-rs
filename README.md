@@ -139,6 +139,35 @@ run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).awai
 # }
 ```
 
+For a service that must remain on one macOS or Linux interface, use
+`run_on_interface`. It applies the OS interface binding to the listener,
+temporary error replies, and every ephemeral TFTP transfer socket; it fails
+instead of falling back to an unbound socket. A wildcard address is accepted
+here, because the interface binding already scopes the service:
+
+```rust,no_run
+use std::net::SocketAddr;
+
+use tftp_rs::server::{run_on_interface, ServerConfig, ServerEvent};
+use tokio::sync::{mpsc, watch};
+
+# async fn example() -> anyhow::Result<()> {
+let bind: SocketAddr = "192.0.2.1:69".parse()?;
+let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+run_on_interface(
+    bind,
+    "en7",
+    "/srv/tftp".into(),
+    events,
+    shutdown_rx,
+    ServerConfig::default(),
+)
+.await?;
+# Ok(())
+# }
+```
+
 The TUI binary remains the default Cargo feature. Embedders can avoid its
 dashboard and HTTP dependencies with `tftp-rs = { default-features = false,
 ... }`.
