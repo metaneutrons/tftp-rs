@@ -1,9 +1,14 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use anyhow::Context;
 use anyhow::{Result, anyhow};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -68,12 +73,102 @@ impl Default for ServerConfig {
     }
 }
 
+/// A current operating-system network interface resolved by name.
+#[derive(Debug, Clone)]
+struct InterfaceBinding {
+    name: String,
+    #[cfg(target_os = "macos")]
+    index: NonZeroU32,
+}
+
+impl InterfaceBinding {
+    fn from_name(name: &str) -> Result<Self> {
+        if name.is_empty() {
+            return Err(anyhow!("network interface name must not be empty"));
+        }
+
+        #[cfg(target_os = "macos")]
+        let index = resolve_interface_index(name)?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = resolve_interface_index(name)?;
+
+        Ok(Self {
+            name: name.to_owned(),
+            #[cfg(target_os = "macos")]
+            index,
+        })
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn apply_to(&self, socket: &socket2::Socket, local_addr: SocketAddr) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = local_addr;
+            socket
+                .bind_device(Some(self.name.as_bytes()))
+                .with_context(|| {
+                    format!(
+                        "cannot bind UDP socket to network interface '{}' (SO_BINDTODEVICE)",
+                        self.name
+                    )
+                })
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let result = if local_addr.is_ipv4() {
+                socket.bind_device_by_index_v4(Some(self.index))
+            } else {
+                socket.bind_device_by_index_v6(Some(self.index))
+            };
+            result.with_context(|| {
+                format!(
+                    "cannot bind UDP socket to network interface '{}' (IP_BOUND_IF/IPV6_BOUND_IF)",
+                    self.name
+                )
+            })
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = socket;
+            let _ = local_addr;
+            Err(anyhow!(
+                "interface-bound UDP sockets are currently supported only on macOS and Linux"
+            ))
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_interface_index(name: &str) -> Result<NonZeroU32> {
+    let name_c = CString::new(name).context("network interface name contains a NUL byte")?;
+    let index = unsafe { libc::if_nametoindex(name_c.as_ptr()) };
+    NonZeroU32::new(index).ok_or_else(|| {
+        anyhow!(
+            "network interface '{name}' was not found: {}",
+            std::io::Error::last_os_error()
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn resolve_interface_index(_name: &str) -> Result<NonZeroU32> {
+    Err(anyhow!(
+        "interface-bound UDP sockets are currently supported only on macOS and Linux"
+    ))
+}
+
 /// Groups the per-transfer "infrastructure" parameters passed to RRQ/WRQ
 /// handlers, keeping the argument count within the linter threshold.
 struct TransferContext {
     id: u64,
     peer: SocketAddr,
     local_addr: SocketAddr,
+    interface: Option<InterfaceBinding>,
     dir: Arc<PathBuf>,
     tx: mpsc::UnboundedSender<ServerEvent>,
     config: Arc<ServerConfig>,
@@ -172,12 +267,46 @@ async fn send_resilient(sock: &UdpSocket, buf: &[u8]) -> Result<()> {
     ))
 }
 
+/// Create a UDP socket on an explicit address, optionally constrained to one
+/// operating-system network interface.
+///
+/// The interface option is applied before `bind`, so this helper can be used
+/// for the listener, temporary error replies, and every per-transfer socket.
+fn bind_udp_socket(
+    local_addr: SocketAddr,
+    interface: Option<&InterfaceBinding>,
+    buffer_size: Option<usize>,
+) -> Result<UdpSocket> {
+    let domain = if local_addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+    let raw = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+
+    if let Some(buffer_size) = buffer_size {
+        let _ = raw.set_send_buffer_size(buffer_size);
+        let _ = raw.set_recv_buffer_size(buffer_size);
+    }
+
+    if let Some(interface) = interface {
+        interface.apply_to(&raw, local_addr)?;
+    }
+
+    raw.bind(&local_addr.into())?;
+    raw.set_nonblocking(true)?;
+
+    let std_sock: std::net::UdpSocket = raw.into();
+    Ok(UdpSocket::from_std(std_sock)?)
+}
+
 /// Create an ephemeral UDP socket with send/receive buffers sized for the
 /// negotiated block size.  The OS default buffer (~9 KB on macOS) is too
 /// small for blksize values above ~8 KB and causes "No buffer space
 /// available" (ENOBUFS / os error 55).
 async fn bind_transfer_socket(
     local_addr: SocketAddr,
+    interface: Option<&InterfaceBinding>,
     peer: SocketAddr,
     blksize: usize,
 ) -> Result<UdpSocket> {
@@ -187,29 +316,11 @@ async fn bind_transfer_socket(
         ));
     }
 
-    // Build the socket via socket2 so we can set buffer sizes before
-    // handing it to tokio.
-    let domain = if local_addr.is_ipv6() {
-        socket2::Domain::IPV6
-    } else {
-        socket2::Domain::IPV4
-    };
-    let raw = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-
     // Need room for a comfortable number of packets in flight.
     let buf_size = ((4 + blksize) * 16).max(256 * 1024);
-    let _ = raw.set_send_buffer_size(buf_size);
-    let _ = raw.set_recv_buffer_size(buf_size);
-
     // Each transfer retains the listener's explicitly selected local address.
     // Using an ephemeral port must not silently turn this into a wildcard bind.
-    let bind_addr = with_port(local_addr, 0);
-    raw.bind(&bind_addr.into())?;
-    raw.set_nonblocking(true)?;
-
-    // Convert: socket2 -> std -> tokio.
-    let std_sock: std::net::UdpSocket = raw.into();
-    let sock = UdpSocket::from_std(std_sock)?;
+    let sock = bind_udp_socket(with_port(local_addr, 0), interface, Some(buf_size))?;
     sock.connect(peer).await?;
 
     Ok(sock)
@@ -239,8 +350,14 @@ fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
     }
 }
 
-async fn send_error(local_addr: SocketAddr, peer: SocketAddr, code: u16, message: &str) {
-    if let Ok(socket) = UdpSocket::bind(with_port(local_addr, 0)).await {
+async fn send_error(
+    local_addr: SocketAddr,
+    interface: Option<&InterfaceBinding>,
+    peer: SocketAddr,
+    code: u16,
+    message: &str,
+) {
+    if let Ok(socket) = bind_udp_socket(with_port(local_addr, 0), interface, None) {
         let error = Packet::ERROR {
             code,
             msg: message.to_string(),
@@ -388,13 +505,52 @@ pub async fn run(
     bind_addr: SocketAddr,
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    config: ServerConfig,
+) -> Result<()> {
+    run_inner(bind_addr, None, dir, tx, shutdown, config).await
+}
+
+/// Run the TFTP server on one explicit local address and one named network
+/// interface.
+///
+/// On Linux, the listener, temporary error sockets, and every transfer socket
+/// use `SO_BINDTODEVICE`. On macOS they use `IP_BOUND_IF` or `IPV6_BOUND_IF`.
+/// This is intentionally a fail-closed operation: a missing interface or a
+/// socket-option failure returns an error and never falls back to an unbound
+/// socket. Wildcard addresses are rejected as with [`run`].
+pub async fn run_on_interface(
+    bind_addr: SocketAddr,
+    interface_name: &str,
+    dir: PathBuf,
+    tx: mpsc::UnboundedSender<ServerEvent>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    config: ServerConfig,
+) -> Result<()> {
+    validate_bind_addr(bind_addr)?;
+    let interface = InterfaceBinding::from_name(interface_name)?;
+    run_inner(bind_addr, Some(interface), dir, tx, shutdown, config).await
+}
+
+async fn run_inner(
+    bind_addr: SocketAddr,
+    interface: Option<InterfaceBinding>,
+    dir: PathBuf,
+    tx: mpsc::UnboundedSender<ServerEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     config: ServerConfig,
 ) -> Result<()> {
     validate_bind_addr(bind_addr)?;
-    let sock = UdpSocket::bind(bind_addr).await?;
+    let sock = bind_udp_socket(bind_addr, interface.as_ref(), None)?;
     let local_addr = sock.local_addr()?;
-    tx.send(ServerEvent::Log(format!("Listening on {local_addr}")))?;
+    let listener_description = match interface.as_ref() {
+        Some(interface) => format!(
+            "Listening on {local_addr} via interface {}",
+            interface.name()
+        ),
+        None => format!("Listening on {local_addr}"),
+    };
+    tx.send(ServerEvent::Log(listener_description))?;
 
     let detected_blksize = max_blksize();
     let effective_max_blksize = if config.max_block_size > 0 {
@@ -441,7 +597,7 @@ pub async fn run(
                     Packet::RRQ { filename, mode, options } => {
                         if !config.enable_read {
                             let _ = tx.send(ServerEvent::Log(format!("{peer}: RRQ rejected (reads disabled)")));
-                            send_error(local_addr, peer, 2, "Read access denied").await;
+                            send_error(local_addr, interface.as_ref(), peer, 2, "Read access denied").await;
                             continue;
                         }
 
@@ -459,9 +615,10 @@ pub async fn run(
                         let tx2 = tx.clone();
                         let dir2 = Arc::clone(&dir);
                         let cfg = Arc::clone(&config);
+                        let interface2 = interface.clone();
                         let rip = Arc::clone(&reqs_in_progress);
                         tokio::spawn(async move {
-                            let result = handle_rrq(TransferContext { id, peer, local_addr, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
+                            let result = handle_rrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
                             if let Err(e) = result {
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
@@ -472,7 +629,7 @@ pub async fn run(
                     Packet::WRQ { filename, mode, options } => {
                         if !config.enable_write {
                             let _ = tx.send(ServerEvent::Log(format!("{peer}: WRQ rejected (writes disabled)")));
-                            send_error(local_addr, peer, 2, "Write access denied").await;
+                            send_error(local_addr, interface.as_ref(), peer, 2, "Write access denied").await;
                             continue;
                         }
 
@@ -490,9 +647,10 @@ pub async fn run(
                         let tx2 = tx.clone();
                         let dir2 = Arc::clone(&dir);
                         let cfg = Arc::clone(&config);
+                        let interface2 = interface.clone();
                         let rip = Arc::clone(&reqs_in_progress);
                         tokio::spawn(async move {
-                            let result = handle_wrq(TransferContext { id, peer, local_addr, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
+                            let result = handle_wrq(TransferContext { id, peer, local_addr, interface: interface2, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
                             if let Err(e) = result {
                                 // Clean up the incomplete .part file.
@@ -536,6 +694,7 @@ async fn handle_rrq(
         id,
         peer,
         local_addr,
+        interface,
         dir,
         tx,
         config,
@@ -604,7 +763,7 @@ async fn handle_rrq(
     }))?;
 
     // Bind an ephemeral socket for this transfer with appropriately sized buffers.
-    let sock = bind_transfer_socket(local_addr, peer, blksize).await?;
+    let sock = bind_transfer_socket(local_addr, interface.as_ref(), peer, blksize).await?;
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let max_retries = config.max_retries;
 
@@ -864,6 +1023,7 @@ async fn handle_wrq(
         id,
         peer,
         local_addr,
+        interface,
         dir,
         tx,
         config,
@@ -875,7 +1035,14 @@ async fn handle_wrq(
     // Overwrite protection.
     if !config.allow_overwrite && path.exists() {
         // Send error to client on a temporary socket.
-        send_error(local_addr, peer, 6, "File already exists").await;
+        send_error(
+            local_addr,
+            interface.as_ref(),
+            peer,
+            6,
+            "File already exists",
+        )
+        .await;
         return Err(anyhow!("file already exists: {}", path.display()));
     }
 
@@ -933,7 +1100,7 @@ async fn handle_wrq(
         size_known: expected_size > 0,
     }))?;
 
-    let sock = bind_transfer_socket(local_addr, peer, blksize).await?;
+    let sock = bind_transfer_socket(local_addr, interface.as_ref(), peer, blksize).await?;
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let max_retries = config.max_retries;
 
@@ -1252,6 +1419,28 @@ pub fn sanitize_path(dir: &Path, filename: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_binding_rejects_embedded_nul() {
+        let error = InterfaceBinding::from_name("en0\0other")
+            .expect_err("network interface names must not contain NUL bytes");
+        assert!(error.to_string().contains("NUL byte"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_binding_resolves_macos_loopback() {
+        let binding = InterfaceBinding::from_name("lo0").expect("macOS loopback interface");
+        assert_eq!(binding.name(), "lo0");
+        assert!(binding.index.get() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interface_binding_resolves_linux_loopback() {
+        let binding = InterfaceBinding::from_name("lo").expect("Linux loopback interface");
+        assert_eq!(binding.name(), "lo");
+    }
 
     #[test]
     fn sanitize_simple_file() {

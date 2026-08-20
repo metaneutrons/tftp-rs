@@ -1681,6 +1681,7 @@ dependencies = [
  "clap",
  "crossterm",
  "if-addrs",
+ "libc",
  "ratatui",
  "socket2",
  "tempfile",
