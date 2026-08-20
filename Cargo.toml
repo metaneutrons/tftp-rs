@@ -10,6 +10,10 @@ repository = "https://github.com/mhajder/tftp-rs"
 keywords = ["TFTP", "server", "TUI", "dashboard", "Rust"]
 categories = ["network-programming", "command-line-utilities"]
 
+[lib]
+name = "tftp_rs"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 axum = "0.8.8"

@@ -1,6 +1,9 @@
 # tftp-rs
 
-A high-performance, single-binary TFTP server with a real-time TUI dashboard. Implements the TFTP protocol from scratch with full support for both Read (RRQ) and Write (WRQ) operations, RFC option negotiation (blksize, timeout, tsize, windowsize), netascii mode, and an optional HTTP file server.
+An embeddable asynchronous TFTP server and a companion TUI binary. It
+implements the TFTP protocol from scratch with full support for both Read
+(RRQ) and Write (WRQ) operations, RFC option negotiation (blksize, timeout,
+tsize, windowsize), netascii mode, and an optional HTTP file server.
 
 ## Implemented RFCs
 
@@ -58,38 +61,39 @@ Download a pre-built binary for your platform from the [Releases](https://github
 ## Usage
 
 ```bash
-# Serve the current directory on port 69 (default)
-tftp-rs
+# Serve the current directory on port 69 (default) from one explicit local IP
+tftp-rs --bind 192.0.2.1
 
 # Serve a specific directory on a custom port
-tftp-rs -p 69 -d /srv/tftp
+tftp-rs --bind 192.0.2.1 -p 69 -d /srv/tftp
 
 # Enable log file output
-tftp-rs -d /srv/tftp -l /var/log/tftp.log
+tftp-rs --bind 192.0.2.1 -d /srv/tftp -l /var/log/tftp.log
 
 # Enable HTTP file server alongside TFTP
-tftp-rs -d /srv/tftp --http-port 8080
+tftp-rs --bind 192.0.2.1 -d /srv/tftp --http-port 8080
 
 # Enable windowed transfers (RFC 7440) for faster throughput
-tftp-rs -d /srv/tftp -w 4
+tftp-rs --bind 192.0.2.1 -d /srv/tftp -w 4
 
 # Set a lower timeout for fast/unstable links
-tftp-rs -d /srv/tftp -t 200
+tftp-rs --bind 192.0.2.1 -d /srv/tftp -t 200
 
 # Limit blksize (useful behind VPNs with small MTU)
-tftp-rs -d /srv/tftp --max-block-size 1468
+tftp-rs --bind 192.0.2.1 -d /srv/tftp --max-block-size 1468
 
 # Reject uploads for existing files
-tftp-rs -d /srv/tftp --allow-overwrite false
+tftp-rs --bind 192.0.2.1 -d /srv/tftp --allow-overwrite false
 
 # All options combined
-tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
+tftp-rs --bind 192.0.2.1 -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 ```
 
 ### CLI Options
 
 ```
 Options:
+      --bind <BIND>                    Local IP address to bind (required; wildcard addresses are refused)
   -p, --port <PORT>                  UDP port to listen on [default: 69]
   -d, --dir <DIR>                    Directory to serve / receive files [default: .]
   -l, --log-file <LOG_FILE>          Optional file path to write logs to
@@ -103,6 +107,30 @@ Options:
       --disable-write                Reject all WRQ (upload) requests
   -h, --help                         Print help
   -V, --version                      Print version
+```
+
+The server deliberately refuses wildcard addresses such as `0.0.0.0` and
+`::`. Each TFTP transfer uses the selected local address as well, with only
+its UDP port made ephemeral.
+
+## Library
+
+The package also exports a `tftp_rs` library target. The caller owns the
+explicit local bind address and shutdown lifecycle:
+
+```rust,no_run
+use std::net::SocketAddr;
+
+use tftp_rs::server::{run, ServerConfig, ServerEvent};
+use tokio::sync::{mpsc, watch};
+
+# async fn example() -> anyhow::Result<()> {
+let bind: SocketAddr = "192.0.2.1:69".parse()?;
+let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).await?;
+# Ok(())
+# }
 ```
 
 ### TUI Controls
@@ -141,7 +169,8 @@ tftp localhost 69
 
 ```
 src/
-  main.rs              Entry point, CLI args (clap), TUI event loop
+  lib.rs               Embeddable library crate
+  main.rs              Companion server binary, CLI args (clap), TUI event loop
   tftp_protocol.rs     TFTP packet parsing/serialization + netascii codec
                        (RFC 1350, 2347, 2348, 2349, 7440)
   server.rs            Async TFTP server (tokio), RRQ + WRQ handlers,
