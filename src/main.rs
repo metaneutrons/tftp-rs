@@ -1,10 +1,9 @@
 mod http_server;
-mod server;
-mod tftp_protocol;
 mod ui;
 
 use std::fs::OpenOptions;
 use std::io::{self, BufWriter};
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,15 +16,19 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tftp_rs::server::{self, ServerConfig, ServerEvent};
 use tokio::sync::{mpsc, watch};
 
-use server::{ServerConfig, ServerEvent};
 use ui::App;
 
 /// A high-performance TFTP server with a TUI dashboard.
 #[derive(Parser, Debug)]
 #[command(name = "tftp-rs", version, about)]
 struct Cli {
+    /// Local IP address to bind. Wildcard addresses are refused.
+    #[arg(long)]
+    bind: IpAddr,
+
     /// UDP port to listen on.
     #[arg(short, long, default_value_t = 69)]
     port: u16,
@@ -79,6 +82,8 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let tftp_addr = SocketAddr::new(cli.bind, cli.port);
+    server::validate_bind_addr(tftp_addr)?;
 
     let dir = std::fs::canonicalize(&cli.dir)?;
 
@@ -116,7 +121,7 @@ async fn main() -> Result<()> {
         let tx = ev_tx.clone();
         let cfg = server_config.clone();
         tokio::spawn(async move {
-            if let Err(e) = server::run(cli.port, dir, tx.clone(), shutdown_rx, cfg).await {
+            if let Err(e) = server::run(tftp_addr, dir, tx.clone(), shutdown_rx, cfg).await {
                 let _ = tx.send(ServerEvent::Log(format!("Server fatal: {e}")));
             }
         })
@@ -126,8 +131,9 @@ async fn main() -> Result<()> {
     if let Some(http_port) = cli.http_port {
         let dir = dir.clone();
         let tx = ev_tx.clone();
+        let http_addr = SocketAddr::new(cli.bind, http_port);
         tokio::spawn(async move {
-            if let Err(e) = http_server::run(http_port, dir, tx.clone(), http_shutdown_rx).await {
+            if let Err(e) = http_server::run(http_addr, dir, tx.clone(), http_shutdown_rx).await {
                 let _ = tx.send(ServerEvent::Log(format!("HTTP server fatal: {e}")));
             }
         });

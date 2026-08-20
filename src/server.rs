@@ -73,6 +73,7 @@ impl Default for ServerConfig {
 struct TransferContext {
     id: u64,
     peer: SocketAddr,
+    local_addr: SocketAddr,
     dir: Arc<PathBuf>,
     tx: mpsc::UnboundedSender<ServerEvent>,
     config: Arc<ServerConfig>,
@@ -175,10 +176,20 @@ async fn send_resilient(sock: &UdpSocket, buf: &[u8]) -> Result<()> {
 /// negotiated block size.  The OS default buffer (~9 KB on macOS) is too
 /// small for blksize values above ~8 KB and causes "No buffer space
 /// available" (ENOBUFS / os error 55).
-async fn bind_transfer_socket(peer: SocketAddr, blksize: usize) -> Result<UdpSocket> {
+async fn bind_transfer_socket(
+    local_addr: SocketAddr,
+    peer: SocketAddr,
+    blksize: usize,
+) -> Result<UdpSocket> {
+    if local_addr.is_ipv4() != peer.is_ipv4() {
+        return Err(anyhow!(
+            "client address family does not match the configured local bind address"
+        ));
+    }
+
     // Build the socket via socket2 so we can set buffer sizes before
     // handing it to tokio.
-    let domain = if peer.is_ipv6() {
+    let domain = if local_addr.is_ipv6() {
         socket2::Domain::IPV6
     } else {
         socket2::Domain::IPV4
@@ -190,12 +201,9 @@ async fn bind_transfer_socket(peer: SocketAddr, blksize: usize) -> Result<UdpSoc
     let _ = raw.set_send_buffer_size(buf_size);
     let _ = raw.set_recv_buffer_size(buf_size);
 
-    // Bind to an OS-assigned port.
-    let bind_addr: SocketAddr = if peer.is_ipv6() {
-        "[::]:0".parse().unwrap()
-    } else {
-        "0.0.0.0:0".parse().unwrap()
-    };
+    // Each transfer retains the listener's explicitly selected local address.
+    // Using an ephemeral port must not silently turn this into a wildcard bind.
+    let bind_addr = with_port(local_addr, 0);
     raw.bind(&bind_addr.into())?;
     raw.set_nonblocking(true)?;
 
@@ -205,6 +213,40 @@ async fn bind_transfer_socket(peer: SocketAddr, blksize: usize) -> Result<UdpSoc
     sock.connect(peer).await?;
 
     Ok(sock)
+}
+
+/// Reject wildcard listeners. A TFTP service must be scoped to an explicitly
+/// selected local address rather than exposed on every host interface.
+pub fn validate_bind_addr(addr: SocketAddr) -> Result<()> {
+    if addr.ip().is_unspecified() {
+        return Err(anyhow!(
+            "wildcard bind address '{addr}' is not allowed; choose an explicit local interface address"
+        ));
+    }
+    Ok(())
+}
+
+fn with_port(addr: SocketAddr, port: u16) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(mut address) => {
+            address.set_port(port);
+            SocketAddr::V4(address)
+        }
+        SocketAddr::V6(mut address) => {
+            address.set_port(port);
+            SocketAddr::V6(address)
+        }
+    }
+}
+
+async fn send_error(local_addr: SocketAddr, peer: SocketAddr, code: u16, message: &str) {
+    if let Ok(socket) = UdpSocket::bind(with_port(local_addr, 0)).await {
+        let error = Packet::ERROR {
+            code,
+            msg: message.to_string(),
+        };
+        let _ = socket.send_to(&error.to_bytes(), peer).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,17 +380,21 @@ fn negotiate_options(
 // Server entry-point
 // ---------------------------------------------------------------------------
 
-/// Run the TFTP server. Returns when `shutdown` is dropped.
+/// Run the TFTP server on one explicit local address.
+///
+/// Wildcard addresses are rejected before opening a socket. Every transfer
+/// socket uses the same local address with an ephemeral port.
 pub async fn run(
-    port: u16,
+    bind_addr: SocketAddr,
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     config: ServerConfig,
 ) -> Result<()> {
-    let addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
-    let sock = UdpSocket::bind(addr).await?;
-    tx.send(ServerEvent::Log(format!("Listening on {addr}")))?;
+    validate_bind_addr(bind_addr)?;
+    let sock = UdpSocket::bind(bind_addr).await?;
+    let local_addr = sock.local_addr()?;
+    tx.send(ServerEvent::Log(format!("Listening on {local_addr}")))?;
 
     let detected_blksize = max_blksize();
     let effective_max_blksize = if config.max_block_size > 0 {
@@ -395,11 +441,7 @@ pub async fn run(
                     Packet::RRQ { filename, mode, options } => {
                         if !config.enable_read {
                             let _ = tx.send(ServerEvent::Log(format!("{peer}: RRQ rejected (reads disabled)")));
-                            // Send error on a temporary socket.
-                            if let Ok(tmp) = UdpSocket::bind("0.0.0.0:0").await {
-                                let err = Packet::ERROR { code: 2, msg: "Read access denied".into() };
-                                let _ = tmp.send_to(&err.to_bytes(), peer).await;
-                            }
+                            send_error(local_addr, peer, 2, "Read access denied").await;
                             continue;
                         }
 
@@ -419,7 +461,7 @@ pub async fn run(
                         let cfg = Arc::clone(&config);
                         let rip = Arc::clone(&reqs_in_progress);
                         tokio::spawn(async move {
-                            let result = handle_rrq(TransferContext { id, peer, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
+                            let result = handle_rrq(TransferContext { id, peer, local_addr, dir: dir2, tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
                             if let Err(e) = result {
                                 let _ = tx2.send(ServerEvent::TransferFailed { id, error: e.to_string() });
@@ -430,10 +472,7 @@ pub async fn run(
                     Packet::WRQ { filename, mode, options } => {
                         if !config.enable_write {
                             let _ = tx.send(ServerEvent::Log(format!("{peer}: WRQ rejected (writes disabled)")));
-                            if let Ok(tmp) = UdpSocket::bind("0.0.0.0:0").await {
-                                let err = Packet::ERROR { code: 2, msg: "Write access denied".into() };
-                                let _ = tmp.send_to(&err.to_bytes(), peer).await;
-                            }
+                            send_error(local_addr, peer, 2, "Write access denied").await;
                             continue;
                         }
 
@@ -453,7 +492,7 @@ pub async fn run(
                         let cfg = Arc::clone(&config);
                         let rip = Arc::clone(&reqs_in_progress);
                         tokio::spawn(async move {
-                            let result = handle_wrq(TransferContext { id, peer, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
+                            let result = handle_wrq(TransferContext { id, peer, local_addr, dir: dir2.clone(), tx: tx2.clone(), config: cfg }, &filename, &mode, &options).await;
                             rip.lock().await.remove(&peer);
                             if let Err(e) = result {
                                 // Clean up the incomplete .part file.
@@ -496,6 +535,7 @@ async fn handle_rrq(
     let TransferContext {
         id,
         peer,
+        local_addr,
         dir,
         tx,
         config,
@@ -564,7 +604,7 @@ async fn handle_rrq(
     }))?;
 
     // Bind an ephemeral socket for this transfer with appropriately sized buffers.
-    let sock = bind_transfer_socket(peer, blksize).await?;
+    let sock = bind_transfer_socket(local_addr, peer, blksize).await?;
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let max_retries = config.max_retries;
 
@@ -823,6 +863,7 @@ async fn handle_wrq(
     let TransferContext {
         id,
         peer,
+        local_addr,
         dir,
         tx,
         config,
@@ -834,13 +875,7 @@ async fn handle_wrq(
     // Overwrite protection.
     if !config.allow_overwrite && path.exists() {
         // Send error to client on a temporary socket.
-        if let Ok(tmp) = UdpSocket::bind("0.0.0.0:0").await {
-            let err = Packet::ERROR {
-                code: 6,
-                msg: "File already exists".into(),
-            };
-            let _ = tmp.send_to(&err.to_bytes(), peer).await;
-        }
+        send_error(local_addr, peer, 6, "File already exists").await;
         return Err(anyhow!("file already exists: {}", path.display()));
     }
 
@@ -898,7 +933,7 @@ async fn handle_wrq(
         size_known: expected_size > 0,
     }))?;
 
-    let sock = bind_transfer_socket(peer, blksize).await?;
+    let sock = bind_transfer_socket(local_addr, peer, blksize).await?;
     let mut recv_buf = vec![0u8; MAX_PACKET];
     let max_retries = config.max_retries;
 
@@ -1154,7 +1189,7 @@ async fn handle_wrq(
 /// Ensure the requested filename stays inside the served directory.
 /// Supports subdirectory paths (e.g. `ios/config/router.cfg`) while
 /// rejecting any traversal attempt (`..`) or absolute paths.
-pub(crate) fn sanitize_path(dir: &Path, filename: &str) -> Result<PathBuf> {
+pub fn sanitize_path(dir: &Path, filename: &str) -> Result<PathBuf> {
     let normalized = filename.replace('\\', "/");
 
     // Reject absolute paths.
