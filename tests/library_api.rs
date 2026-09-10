@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tftp_rs::server::{ServerConfig, ServerEvent, run, run_on_interface, validate_bind_addr};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use tftp_rs::server::run_on_interface;
+use tftp_rs::server::{ServerConfig, ServerEvent, run, validate_bind_addr};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
