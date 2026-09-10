@@ -61,39 +61,42 @@ Download a pre-built binary for your platform from the [Releases](https://github
 ## Usage
 
 ```bash
-# Serve the current directory on port 69 (default) from one explicit local IP
+# Serve the current directory on port 69 (default), on every interface
+tftp-rs
+
+# Pin the service to one local interface address
 tftp-rs --bind 192.0.2.1
 
 # Serve a specific directory on a custom port
-tftp-rs --bind 192.0.2.1 -p 69 -d /srv/tftp
+tftp-rs -p 69 -d /srv/tftp
 
 # Enable log file output
-tftp-rs --bind 192.0.2.1 -d /srv/tftp -l /var/log/tftp.log
+tftp-rs -d /srv/tftp -l /var/log/tftp.log
 
 # Enable HTTP file server alongside TFTP
-tftp-rs --bind 192.0.2.1 -d /srv/tftp --http-port 8080
+tftp-rs -d /srv/tftp --http-port 8080
 
 # Enable windowed transfers (RFC 7440) for faster throughput
-tftp-rs --bind 192.0.2.1 -d /srv/tftp -w 4
+tftp-rs -d /srv/tftp -w 4
 
 # Set a lower timeout for fast/unstable links
-tftp-rs --bind 192.0.2.1 -d /srv/tftp -t 200
+tftp-rs -d /srv/tftp -t 200
 
 # Limit blksize (useful behind VPNs with small MTU)
-tftp-rs --bind 192.0.2.1 -d /srv/tftp --max-block-size 1468
+tftp-rs -d /srv/tftp --max-block-size 1468
 
 # Reject uploads for existing files
-tftp-rs --bind 192.0.2.1 -d /srv/tftp --allow-overwrite false
+tftp-rs -d /srv/tftp --allow-overwrite false
 
 # All options combined
-tftp-rs --bind 192.0.2.1 -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
+tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 ```
 
 ### CLI Options
 
 ```
 Options:
-      --bind <BIND>                    Local IP address to bind (required; wildcard addresses are refused)
+      --bind <BIND>                    Local IP address to bind [default: 0.0.0.0]
   -p, --port <PORT>                  UDP port to listen on [default: 69]
   -d, --dir <DIR>                    Directory to serve / receive files [default: .]
   -l, --log-file <LOG_FILE>          Optional file path to write logs to
@@ -109,9 +112,12 @@ Options:
   -V, --version                      Print version
 ```
 
-The server deliberately refuses wildcard addresses such as `0.0.0.0` and
-`::`. Each TFTP transfer uses the selected local address as well, with only
-its UDP port made ephemeral.
+Each TFTP transfer reuses the listener's local address and only makes its UDP
+port ephemeral. With the default wildcard bind the operating system picks the
+source address per reply, as before. Passing an explicit `--bind` address
+guarantees replies leave from the address the client contacted, which is what
+multi-homed hosts and VPN setups need. Embedders can enforce that with
+`server::validate_bind_addr`.
 
 ## Library
 

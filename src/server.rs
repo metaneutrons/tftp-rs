@@ -201,8 +201,9 @@ async fn bind_transfer_socket(
     let _ = raw.set_send_buffer_size(buf_size);
     let _ = raw.set_recv_buffer_size(buf_size);
 
-    // Each transfer retains the listener's explicitly selected local address.
-    // Using an ephemeral port must not silently turn this into a wildcard bind.
+    // Each transfer retains the listener's local address and only makes the
+    // port ephemeral. An explicit listener address must never widen into a
+    // wildcard bind here; a wildcard listener stays a wildcard.
     let bind_addr = with_port(local_addr, 0);
     raw.bind(&bind_addr.into())?;
     raw.set_nonblocking(true)?;
@@ -215,8 +216,11 @@ async fn bind_transfer_socket(
     Ok(sock)
 }
 
-/// Reject wildcard listeners. A TFTP service must be scoped to an explicitly
-/// selected local address rather than exposed on every host interface.
+/// Reject wildcard listeners.
+///
+/// An opt-in helper for embedders that want the TFTP service scoped to an
+/// explicitly selected local address rather than exposed on every host
+/// interface. [`run`] does not apply it on its own.
 pub fn validate_bind_addr(addr: SocketAddr) -> Result<()> {
     if addr.ip().is_unspecified() {
         return Err(anyhow!(
@@ -380,10 +384,17 @@ fn negotiate_options(
 // Server entry-point
 // ---------------------------------------------------------------------------
 
-/// Run the TFTP server on one explicit local address.
+/// Run the TFTP server on one local address.
 ///
-/// Wildcard addresses are rejected before opening a socket. Every transfer
-/// socket uses the same local address with an ephemeral port.
+/// Every transfer socket reuses the listener's local address with an
+/// ephemeral port. Pass an explicit address, and replies are guaranteed to
+/// leave from the address the client contacted, which matters on a host with
+/// several interfaces. Pass a wildcard such as `0.0.0.0` or `::`, and the
+/// transfer sockets are wildcard-bound too, leaving the source address to the
+/// operating system.
+///
+/// Callers that want to refuse wildcard listeners can check with
+/// [`validate_bind_addr`] first.
 pub async fn run(
     bind_addr: SocketAddr,
     dir: PathBuf,
@@ -391,7 +402,6 @@ pub async fn run(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     config: ServerConfig,
 ) -> Result<()> {
-    validate_bind_addr(bind_addr)?;
     let sock = UdpSocket::bind(bind_addr).await?;
     let local_addr = sock.local_addr()?;
     tx.send(ServerEvent::Log(format!("Listening on {local_addr}")))?;

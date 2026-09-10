@@ -25,8 +25,9 @@ use ui::App;
 #[derive(Parser, Debug)]
 #[command(name = "tftp-rs", version, about)]
 struct Cli {
-    /// Local IP address to bind. Wildcard addresses are refused.
-    #[arg(long)]
+    /// Local IP address to bind. Defaults to every interface. Give an
+    /// explicit address to pin replies to one local interface.
+    #[arg(long, default_value = "0.0.0.0")]
     bind: IpAddr,
 
     /// UDP port to listen on.
@@ -83,7 +84,6 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let tftp_addr = SocketAddr::new(cli.bind, cli.port);
-    server::validate_bind_addr(tftp_addr)?;
 
     let dir = std::fs::canonicalize(&cli.dir)?;
 

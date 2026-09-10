@@ -1,27 +1,76 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use tftp_rs::server::{ServerConfig, ServerEvent, run};
+use tftp_rs::server::{ServerConfig, ServerEvent, run, validate_bind_addr};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
-#[tokio::test]
-async fn rejects_a_wildcard_listener_address() {
-    let dir = tempfile::tempdir().expect("temporary directory");
-    let (events, _event_rx) = mpsc::unbounded_channel();
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    let error = run(
-        SocketAddr::from(([0, 0, 0, 0], 0)),
-        dir.path().to_path_buf(),
-        events,
-        shutdown_rx,
-        ServerConfig::default(),
-    )
-    .await
-    .expect_err("wildcard binds must be rejected");
-
+#[test]
+fn validate_bind_addr_rejects_wildcards_and_accepts_explicit_addresses() {
+    let error = validate_bind_addr(SocketAddr::from(([0, 0, 0, 0], 69)))
+        .expect_err("wildcard binds must be rejected");
     assert!(error.to_string().contains("wildcard bind address"));
+
+    validate_bind_addr(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 69)))
+        .expect_err("the IPv6 wildcard must be rejected too");
+
+    validate_bind_addr(SocketAddr::from(([127, 0, 0, 1], 69)))
+        .expect("an explicit address is accepted");
+}
+
+#[tokio::test]
+async fn serves_from_a_wildcard_listener() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    tokio::fs::write(dir.path().join("hello.txt"), b"AROS")
+        .await
+        .expect("test file");
+
+    let reservation = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .expect("reserve test port");
+    let port = reservation.local_addr().expect("listener address").port();
+    drop(reservation);
+
+    let (events, mut event_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_dir = dir.path().to_path_buf();
+    let server = tokio::spawn(async move {
+        run(
+            SocketAddr::from(([0, 0, 0, 0], port)),
+            server_dir,
+            events,
+            shutdown_rx,
+            ServerConfig::default(),
+        )
+        .await
+    });
+
+    wait_until_listening(&mut event_rx).await;
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.expect("client socket");
+    let server_address = SocketAddr::from(([127, 0, 0, 1], port));
+    client
+        .send_to(&rrq("hello.txt"), server_address)
+        .await
+        .expect("RRQ");
+
+    let mut buffer = [0_u8; 516];
+    let (length, transfer_address) =
+        tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buffer))
+            .await
+            .expect("TFTP response timeout")
+            .expect("TFTP response");
+
+    assert_eq!(&buffer[..4], &[0, 3, 0, 1]);
+    assert_eq!(&buffer[4..length], b"AROS");
+
+    client
+        .send_to(&[0, 4, 0, 1], transfer_address)
+        .await
+        .expect("ACK");
+
+    shutdown_tx.send(true).expect("shutdown signal");
+    server.await.expect("server task").expect("server result");
 }
 
 #[tokio::test]
