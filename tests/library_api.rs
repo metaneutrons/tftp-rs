@@ -175,7 +175,15 @@ async fn serves_from_the_explicit_listener_address() {
     server.await.expect("server task").expect("server result");
 }
 
-#[cfg(target_os = "macos")]
+/// The loopback interface, which is the only device every host is sure to have.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LOOPBACK_INTERFACE: &str = if cfg!(target_os = "macos") {
+    "lo0"
+} else {
+    "lo"
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn binds_listener_and_transfer_sockets_to_named_interface() {
     let dir = tempfile::tempdir().expect("temporary directory");
@@ -195,7 +203,7 @@ async fn binds_listener_and_transfer_sockets_to_named_interface() {
     let server = tokio::spawn(async move {
         run_on_interface(
             listener_address,
-            "lo0",
+            LOOPBACK_INTERFACE,
             server_dir,
             events,
             shutdown_rx,
