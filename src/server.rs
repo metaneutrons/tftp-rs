@@ -533,6 +533,20 @@ pub async fn run(
 /// A wildcard `bind_addr` is accepted, since the interface binding already
 /// scopes the service to one link. Combine it with an explicit address when
 /// the source address of replies has to be pinned as well.
+///
+/// # Privileges
+///
+/// On Linux, `SO_BINDTODEVICE` needs no capability here. The kernel gates it
+/// on `CAP_NET_RAW` in the socket's user namespace only when the socket is
+/// already bound to a device (`net/core/sock.c`, `sock_bindtoindex_locked`),
+/// and every socket this function binds is freshly created and bound once.
+/// Re-binding or clearing an existing device binding would require that
+/// capability. Binding the default TFTP port 69 still needs root or
+/// `CAP_NET_BIND_SERVICE`, exactly as with [`run`].
+///
+/// # Platform support
+///
+/// Linux and macOS only. Other targets return an error.
 pub async fn run_on_interface(
     bind_addr: SocketAddr,
     interface_name: &str,
