@@ -31,7 +31,7 @@ struct Cli {
     bind: IpAddr,
 
     /// Bind every TFTP socket to this network interface, for example eth0.
-    /// Requires Linux or macOS. A missing interface is a fatal error.
+    /// Linux and macOS only. An unknown interface aborts startup.
     #[arg(long)]
     interface: Option<String>,
 
@@ -89,6 +89,12 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let tftp_addr = SocketAddr::new(cli.bind, cli.port);
+
+    // Fail before the dashboard takes over the terminal. A server error after
+    // that point only reaches the user as a log line in the TUI.
+    if let Some(interface) = cli.interface.as_deref() {
+        server::validate_interface(interface)?;
+    }
 
     let dir = std::fs::canonicalize(&cli.dir)?;
 

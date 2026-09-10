@@ -522,6 +522,16 @@ pub async fn run(
     run_inner(bind_addr, None, dir, tx, shutdown, config).await
 }
 
+/// Check that a named network interface exists and can be bound on this
+/// platform.
+///
+/// Returns the same error [`run_on_interface`] would, but without opening a
+/// socket, so a caller can reject a bad `--interface` before it starts doing
+/// real work. On targets other than Linux and macOS this always fails.
+pub fn validate_interface(name: &str) -> Result<()> {
+    InterfaceBinding::from_name(name).map(|_| ())
+}
+
 /// Run the TFTP server on one local address and one named network interface.
 ///
 /// On Linux, the listener, temporary error sockets, and every transfer socket
