@@ -88,6 +88,9 @@ tftp-rs -d /srv/tftp --max-block-size 1468
 # Reject uploads for existing files
 tftp-rs -d /srv/tftp --allow-overwrite false
 
+# Keep the service on one network interface (Linux/macOS)
+tftp-rs --bind 192.0.2.1 --interface eth0 -d /srv/tftp
+
 # All options combined
 tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 ```
@@ -97,6 +100,7 @@ tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 ```
 Options:
       --bind <BIND>                    Local IP address to bind [default: 0.0.0.0]
+      --interface <INTERFACE>          Bind every TFTP socket to this network interface (Linux/macOS)
   -p, --port <PORT>                  UDP port to listen on [default: 69]
   -d, --dir <DIR>                    Directory to serve / receive files [default: .]
   -l, --log-file <LOG_FILE>          Optional file path to write logs to
@@ -138,6 +142,40 @@ run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).awai
 # Ok(())
 # }
 ```
+
+For a service that must remain on one macOS or Linux interface, use
+`run_on_interface`. It applies the OS interface binding to the listener,
+temporary error replies, and every ephemeral TFTP transfer socket; it fails
+instead of falling back to an unbound socket. A wildcard address is accepted
+here, because the interface binding already scopes the service:
+
+```rust,no_run
+use std::net::SocketAddr;
+
+use tftp_rs::server::{run_on_interface, ServerConfig, ServerEvent};
+use tokio::sync::{mpsc, watch};
+
+# async fn example() -> anyhow::Result<()> {
+let bind: SocketAddr = "192.0.2.1:69".parse()?;
+let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+run_on_interface(
+    bind,
+    "en7",
+    "/srv/tftp".into(),
+    events,
+    shutdown_rx,
+    ServerConfig::default(),
+)
+.await?;
+# Ok(())
+# }
+```
+
+On Linux this needs no `CAP_NET_RAW`. The kernel requires that capability
+only when a socket is re-bound to a different device, and each socket here
+is created and bound once. Serving the default port 69 still needs root or
+`CAP_NET_BIND_SERVICE`.
 
 The TUI binary remains the default Cargo feature. Embedders can avoid its
 dashboard and HTTP dependencies with `tftp-rs = { default-features = false,

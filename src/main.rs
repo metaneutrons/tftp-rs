@@ -30,6 +30,11 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0")]
     bind: IpAddr,
 
+    /// Bind every TFTP socket to this network interface, for example eth0.
+    /// Linux and macOS only. An unknown interface aborts startup.
+    #[arg(long)]
+    interface: Option<String>,
+
     /// UDP port to listen on.
     #[arg(short, long, default_value_t = 69)]
     port: u16,
@@ -85,6 +90,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let tftp_addr = SocketAddr::new(cli.bind, cli.port);
 
+    // Fail before the dashboard takes over the terminal. A server error after
+    // that point only reaches the user as a log line in the TUI.
+    if let Some(interface) = cli.interface.as_deref() {
+        server::validate_interface(interface)?;
+    }
+
     let dir = std::fs::canonicalize(&cli.dir)?;
 
     let log_writer = match cli.log_file {
@@ -120,8 +131,23 @@ async fn main() -> Result<()> {
         let dir = dir.clone();
         let tx = ev_tx.clone();
         let cfg = server_config.clone();
+        let interface = cli.interface.clone();
         tokio::spawn(async move {
-            if let Err(e) = server::run(tftp_addr, dir, tx.clone(), shutdown_rx, cfg).await {
+            let result = match interface.as_deref() {
+                Some(interface) => {
+                    server::run_on_interface(
+                        tftp_addr,
+                        interface,
+                        dir,
+                        tx.clone(),
+                        shutdown_rx,
+                        cfg,
+                    )
+                    .await
+                }
+                None => server::run(tftp_addr, dir, tx.clone(), shutdown_rx, cfg).await,
+            };
+            if let Err(e) = result {
                 let _ = tx.send(ServerEvent::Log(format!("Server fatal: {e}")));
             }
         })
