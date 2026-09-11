@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph};
 
-use crate::server::{TransferInfo, TransferKind};
+use tftp_rs::server::{TransferInfo, TransferKind};
 
 /// How often to refresh the interface IP list.
 const IP_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);

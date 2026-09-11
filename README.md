@@ -1,6 +1,9 @@
 # tftp-rs
 
-A high-performance, single-binary TFTP server with a real-time TUI dashboard. Implements the TFTP protocol from scratch with full support for both Read (RRQ) and Write (WRQ) operations, RFC option negotiation (blksize, timeout, tsize, windowsize), netascii mode, and an optional HTTP file server.
+An embeddable asynchronous TFTP server and a companion TUI binary. It
+implements the TFTP protocol from scratch with full support for both Read
+(RRQ) and Write (WRQ) operations, RFC option negotiation (blksize, timeout,
+tsize, windowsize), netascii mode, and an optional HTTP file server.
 
 ## Implemented RFCs
 
@@ -58,8 +61,11 @@ Download a pre-built binary for your platform from the [Releases](https://github
 ## Usage
 
 ```bash
-# Serve the current directory on port 69 (default)
+# Serve the current directory on port 69 (default), on every interface
 tftp-rs
+
+# Pin the service to one local interface address
+tftp-rs --bind 192.0.2.1
 
 # Serve a specific directory on a custom port
 tftp-rs -p 69 -d /srv/tftp
@@ -90,6 +96,7 @@ tftp-rs -p 69 -d /srv/tftp -l /var/log/tftp.log --http-port 8080 -w 4 -t 200
 
 ```
 Options:
+      --bind <BIND>                    Local IP address to bind [default: 0.0.0.0]
   -p, --port <PORT>                  UDP port to listen on [default: 69]
   -d, --dir <DIR>                    Directory to serve / receive files [default: .]
   -l, --log-file <LOG_FILE>          Optional file path to write logs to
@@ -104,6 +111,37 @@ Options:
   -h, --help                         Print help
   -V, --version                      Print version
 ```
+
+Each TFTP transfer reuses the listener's local address and only makes its UDP
+port ephemeral. With the default wildcard bind the operating system picks the
+source address per reply, as before. Passing an explicit `--bind` address
+guarantees replies leave from the address the client contacted, which is what
+multi-homed hosts and VPN setups need. Embedders can enforce that with
+`server::validate_bind_addr`.
+
+## Library
+
+The package also exports a `tftp_rs` library target. The caller owns the
+explicit local bind address and shutdown lifecycle:
+
+```rust,no_run
+use std::net::SocketAddr;
+
+use tftp_rs::server::{run, ServerConfig, ServerEvent};
+use tokio::sync::{mpsc, watch};
+
+# async fn example() -> anyhow::Result<()> {
+let bind: SocketAddr = "192.0.2.1:69".parse()?;
+let (events, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+run(bind, "/srv/tftp".into(), events, shutdown_rx, ServerConfig::default()).await?;
+# Ok(())
+# }
+```
+
+The TUI binary remains the default Cargo feature. Embedders can avoid its
+dashboard and HTTP dependencies with `tftp-rs = { default-features = false,
+... }`.
 
 ### TUI Controls
 
@@ -141,7 +179,8 @@ tftp localhost 69
 
 ```
 src/
-  main.rs              Entry point, CLI args (clap), TUI event loop
+  lib.rs               Embeddable library crate
+  main.rs              Companion server binary, CLI args (clap), TUI event loop
   tftp_protocol.rs     TFTP packet parsing/serialization + netascii codec
                        (RFC 1350, 2347, 2348, 2349, 7440)
   server.rs            Async TFTP server (tokio), RRQ + WRQ handlers,

@@ -11,7 +11,7 @@ use axum::response::{Html, IntoResponse, Response};
 use tokio::sync::{mpsc, watch};
 use tokio_util::io::ReaderStream;
 
-use crate::server::{ServerEvent, sanitize_path};
+use tftp_rs::server::{ServerEvent, sanitize_path, validate_bind_addr};
 
 struct HttpState {
     dir: PathBuf,
@@ -19,11 +19,12 @@ struct HttpState {
 }
 
 pub async fn run(
-    port: u16,
+    addr: SocketAddr,
     dir: PathBuf,
     tx: mpsc::UnboundedSender<ServerEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    validate_bind_addr(addr)?;
     let state = Arc::new(HttpState {
         dir,
         tx: tx.clone(),
@@ -34,8 +35,7 @@ pub async fn run(
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    let addr = format!("0.0.0.0:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     tx.send(ServerEvent::Log(format!("HTTP server listening on {addr}")))?;
 
     axum::serve(listener, app)
